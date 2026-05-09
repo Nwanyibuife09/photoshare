@@ -1,35 +1,87 @@
-import { useState } from 'react'
-import reactLogo from './assets/react.svg'
-import viteLogo from '/vite.svg'
-import './App.css'
+import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
+import { AuthProvider, useAuth } from './context/AuthContext';
 
-function App() {
-  const [count, setCount] = useState(0)
+import Navbar from './components/Navbar';
 
-  return (
-    <>
-      <div>
-        <a href="https://vite.dev" target="_blank">
-          <img src={viteLogo} className="logo" alt="Vite logo" />
-        </a>
-        <a href="https://react.dev" target="_blank">
-          <img src={reactLogo} className="logo react" alt="React logo" />
-        </a>
-      </div>
-      <h1>Vite + React</h1>
-      <div className="card">
-        <button onClick={() => setCount((count) => count + 1)}>
-          count is {count}
-        </button>
-        <p>
-          Edit <code>src/App.tsx</code> and save to test HMR
-        </p>
-      </div>
-      <p className="read-the-docs">
-        Click on the Vite and React logos to learn more
-      </p>
-    </>
-  )
+import Home from './pages/Home';
+import Login from './pages/Login';
+import Register from './pages/Register';
+import CreatorDashboard from './pages/CreatorDashboard';
+import PhotoDetailPage from './pages/PhotoDetail';
+
+import './App.css';
+
+const ProtectedRoute = ({
+  children,
+  requireCreator = false,
+}: {
+  children: React.ReactElement;
+  requireCreator?: boolean;
+}) => {
+  const { user, loading } = useAuth();
+if (loading) return <div>Loading...</div>;
+
+if (!user) return <Navigate to="/login" replace />;
+
+if (requireCreator && !user.is_creator) {
+  return <Navigate to="/" replace />;
 }
 
-export default App
+  return children;
+};
+
+function AppRoutes() {
+
+  const { user, loading } = useAuth();
+
+console.log("USER:", user);
+console.log("LOADING:", loading);
+
+  return (
+    <div className="app-container">
+      <Navbar />
+
+      <main className="main-content">
+        <Routes>
+          <Route path="/" element={<Home />} />
+
+          <Route
+            path="/dashboard"
+            element={
+              <ProtectedRoute>
+                <CreatorDashboard />
+              </ProtectedRoute>
+            }
+          />
+
+          <Route path="/login" element={<Login />} />
+
+          <Route path="/register" element={<Register />} />
+
+          <Route path="/photo/:id" element={<PhotoDetailPage />} />
+
+          <Route
+            path="/creator"
+            element={
+              <ProtectedRoute requireCreator={true}>
+                <CreatorDashboard />
+              </ProtectedRoute>
+            }
+          />
+        </Routes>
+      </main>
+    </div>
+  );
+}
+
+function App() {
+  return (
+    <AuthProvider>
+      <BrowserRouter>
+        <AppRoutes />
+      </BrowserRouter>
+    </AuthProvider>
+  );
+}
+
+export default App;

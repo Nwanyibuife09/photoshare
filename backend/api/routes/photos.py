@@ -1,22 +1,24 @@
 import os
 import uuid
 import shutil
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, status, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, UploadFile, File, Form, status, Query
 from sqlalchemy.orm import Session
 from typing import Optional, List
 from ...database.db import get_db
 from ...database.models import Photo, User, Comment, Rating
 from ...schemas.schemas import PhotoResponse
 from ...auth import get_current_user, require_creator
+from ...services import process_uploaded_image
 
 router = APIRouter()
 
-UPLOAD_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "uploads")
+UPLOAD_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))), "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 
 @router.post("/", response_model=PhotoResponse, status_code=status.HTTP_201_CREATED)
 def upload_photo(
+    background_tasks: BackgroundTasks,
     title: str = Form(...),
     caption: str = Form(...),
     location: Optional[str] = Form(None),
@@ -25,7 +27,7 @@ def upload_photo(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_creator),
 ):
-    """Upload a new photo (creator only)."""
+    """Upload a new photo (creator only). Triggers background thumbnail."""
     allowed_types = ["image/jpeg", "image/png", "image/gif", "image/webp"]
     if file.content_type not in allowed_types:
         raise HTTPException(status_code=400, detail="File type not allowed. Use JPEG, PNG, GIF, or WebP.")
@@ -48,8 +50,19 @@ def upload_photo(
     db.add(db_photo)
     db.commit()
     db.refresh(db_photo)
+
+    # Trigger background processing: thumbnail generation
+    background_tasks.add_task(process_uploaded_image, db_photo.id, filename)
+
     return db_photo
 
+
+import json
+import redis
+from ...config import settings
+
+# Initialize Redis client
+redis_client = redis.from_url(settings.REDIS_URL)
 
 @router.get("/", response_model=List[PhotoResponse])
 def list_photos(
@@ -58,7 +71,17 @@ def list_photos(
     limit: int = Query(20, ge=1, le=100),
     db: Session = Depends(get_db),
 ):
-    """List all photos, optionally search by title/tags/location."""
+    """List all photos, optionally search by title/tags/location. Cached in Redis."""
+    cache_key = f"photos:search:{search}:skip:{skip}:limit:{limit}"
+    
+    # Try fetching from cache
+    try:
+        cached_data = redis_client.get(cache_key)
+        if cached_data:
+            return json.loads(cached_data)
+    except redis.ConnectionError:
+        pass # Fallback to DB if Redis is down
+
     query = db.query(Photo)
     if search:
         search_term = f"%{search}%"
@@ -68,7 +91,29 @@ def list_photos(
             | (Photo.location.ilike(search_term))
             | (Photo.caption.ilike(search_term))
         )
-    return query.order_by(Photo.created_at.desc()).offset(skip).limit(limit).all()
+    
+    results = query.order_by(Photo.created_at.desc()).offset(skip).limit(limit).all()
+    
+    # Serialize and cache results for 60 seconds
+    try:
+        serialized_results = [
+            {
+                "id": p.id,
+                "title": p.title,
+                "caption": p.caption,
+                "location": p.location,
+                "tags": p.tags,
+                "s3_path": p.s3_path,
+                "thumbnail_path": p.thumbnail_path,
+                "created_at": p.created_at.isoformat(),
+                "owner_id": p.owner_id
+            } for p in results
+        ]
+        redis_client.setex(cache_key, 60, json.dumps(serialized_results))
+    except redis.ConnectionError:
+        pass
+
+    return results
 
 
 @router.get("/{photo_id}")
@@ -144,3 +189,58 @@ def rate_photo(
 
     db.commit()
     return {"message": "Rating submitted", "score": score}
+
+
+@router.delete("/{photo_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_photo(
+    photo_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Delete a photo (only the owner/creator can delete their photo)."""
+    photo = db.query(Photo).filter(Photo.id == photo_id).first()
+    
+    if not photo:
+        raise HTTPException(status_code=404, detail="Photo not found")
+        
+    if photo.owner_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, 
+            detail="You are not authorized to delete this photo"
+        )
+
+    # 1. Delete files from OS
+    if photo.s3_path:
+        filename = photo.s3_path.split("/")[-1]
+        filepath = os.path.join(UPLOAD_DIR, filename)
+        if os.path.exists(filepath):
+            try:
+                os.remove(filepath)
+            except Exception as e:
+                print(f"Failed to delete original image {filepath}: {e}")
+
+    if photo.thumbnail_path:
+        thumb_filename = photo.thumbnail_path.split("/")[-1]
+        thumb_filepath = os.path.join(UPLOAD_DIR, "thumbnails", thumb_filename)
+        if os.path.exists(thumb_filepath):
+            try:
+                os.remove(thumb_filepath)
+            except Exception as e:
+                print(f"Failed to delete thumbnail {thumb_filepath}: {e}")
+
+    # 2. Delete database record
+    db.delete(photo)
+    db.commit()
+    
+    # Attempt to invalidate Redis cache (broad invalidation for simplicity)
+    try:
+        from ...config import settings
+        import redis
+        redis_client = redis.from_url(settings.REDIS_URL)
+        # Find all keys matching the photos cache pattern
+        for key in redis_client.scan_iter("photos:search:*"):
+            redis_client.delete(key)
+    except Exception as e:
+        print(f"Failed to invalidate cache: {e}")
+
+    return None

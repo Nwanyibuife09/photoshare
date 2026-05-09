@@ -23,7 +23,7 @@ for creator_data in creators:
     user = User(
         username=creator_data["username"],
         email=creator_data["email"],
-        hashed_password=get_password_hash(creator_data["password"]),
+        hashed_password=get_password_hash(creator_data["password"][:72]),
         is_creator=True,
     )
     db.add(user)
